@@ -1,4 +1,3 @@
-/* /home/user/project/src/child.c */
 /*
  * child.c
  *
@@ -71,21 +70,25 @@ static void initialize_globals(void);
 int main(int argc, char *argv[]) {
     (void)argv; // Explicitly mark argv as unused
 
+    pid_t my_pid = getpid(); // Get PID early for messages
+
     // Child doesn't expect specific arguments from the parent's execv call
     if (argc > 1) {
-        if (fprintf(stderr, "CHILD [%d]: Warning: Received unexpected arguments.\n", getpid()) < 0) { /* Handle error? */ }
+        // Use \r\n for stderr messages for better raw mode display
+        if (fprintf(stderr, "CHILD [%d]: Warning: Received unexpected arguments.\r\n", my_pid) < 0) { /* Handle error? */ }
     }
 
     // --- Initialization ---
     initialize_globals(); // Explicitly initialize static globals at runtime
 
-    pid_t my_pid = getpid();
     pid_t parent_pid = getppid();
 
-    if (fprintf(stderr, "CHILD [%d]: Started. PPID=%d. Output initially %s. Will run %d reps.\n",
+    // Use \r\n for stderr messages
+    if (fprintf(stderr, "CHILD [%d]: Started. PPID=%d. Output initially %s. Will run %d reps.\r\n",
         my_pid, parent_pid, g_output_enabled ? "ENABLED" : "DISABLED", NUM_REPETITIONS) < 0) { /* Handle error? */ }
         if (fflush(stderr) == EOF) {
-            perror("CHILD: Error flushing stderr");
+            // Use \r\n for stderr messages
+            fprintf(stderr, "CHILD [%d]: Error flushing stderr on start: %s\r\n", my_pid, strerror(errno));
             // Continue if possible
         }
 
@@ -120,7 +123,8 @@ int main(int argc, char *argv[]) {
             // Alarm has fired. Re-arm the timer if needed.
             if (g_repetitions_done < NUM_REPETITIONS) {
                 if (setup_timer() != 0) {
-                    if (fprintf(stderr, "CHILD [%d]: Error re-arming timer. Exiting loop.\n", my_pid) < 0) { /* Handle error? */ }
+                    // Use \r\n for stderr messages
+                    if (fprintf(stderr, "CHILD [%d]: Error re-arming timer. Exiting loop.\r\n", my_pid) < 0) { /* Handle error? */ }
                     break; // Exit the loop on timer error
                 }
             }
@@ -129,22 +133,26 @@ int main(int argc, char *argv[]) {
 
         // --- Print Statistics (Conditionally) ---
         if (g_output_enabled) {
-            // Final output MUST be on a single line to stdout, as specified.
-            if (printf("CHILD [%d]: PPID=%d, PID=%d, STATS={00:%lld, 01:%lld, 10:%lld, 11:%lld}\n",
-                my_pid, parent_pid, my_pid,
+            // Final stats output to stdout uses \n as required by spec (single line)
+            if (printf("PPID=%d, PID=%d, STATS={00:%lld, 01:%lld, 10:%lld, 11:%lld}\n",
+                parent_pid, my_pid,
                 g_count00, g_count01, g_count10, g_count11) < 0) {
-                perror("CHILD: Error writing final stats to stdout");
-                // Still attempt to exit successfully
+                // Use \r\n for stderr messages
+                fprintf(stderr, "CHILD [%d]: Error writing final stats to stdout: %s\r\n", my_pid, strerror(errno));
                 }
                 if (fflush(stdout) == EOF) {
-                    perror("CHILD: Error flushing stdout");
-                    // Exit successfully anyway
+                    // Use \r\n for stderr messages
+                    fprintf(stderr, "CHILD [%d]: Error flushing stdout for stats: %s\r\n", my_pid, strerror(errno));
                 }
         } else {
-            // Output suppressed, optionally notify via stderr
-            if (fprintf(stderr, "CHILD [%d]: Final statistics output suppressed by signal.\n", my_pid) < 0) { /* Handle error? */ }
-            if (fflush(stderr) == EOF) { /* Handle error? */ }
+            // Output suppressed, notify via stderr using \r\n
+            if (fprintf(stderr, "CHILD [%d]: Final statistics output suppressed by signal.\r\n", my_pid) < 0) { /* Handle error? */ }
+            if (fflush(stderr) == EOF) { /* Handle error? */ } // Error already printed if needed
         }
+
+        // Use \r\n for final stderr message
+        if (fprintf(stderr, "CHILD [%d]: Exiting normally.\r\n", my_pid) < 0) { /* Handle error? */ }
+        if (fflush(stderr) == EOF) { /* Handle error? */ }
 
         return EXIT_SUCCESS;
 }
@@ -198,7 +206,6 @@ static void handle_alarm(int sig) {
         }
         g_alarm_flag = 1; // Signal the main loop
     }
-    // No need to re-arm timer here; main loop calls setup_timer again
 }
 
 /*
@@ -233,24 +240,26 @@ static void handle_usr_signals(int sig) {
  */
 static int register_signal_handlers(void) {
     struct sigaction sa_alarm, sa_usr;
+    pid_t my_pid = getpid(); // For error messages
 
     // --- Configure SIGALRM handler ---
     memset(&sa_alarm, 0, sizeof(sa_alarm));
     sa_alarm.sa_handler = handle_alarm;
     if (sigemptyset(&sa_alarm.sa_mask) == -1) {
-        perror("CHILD: Error initializing alarm signal mask");
+        // Use \r\n for stderr messages
+        fprintf(stderr, "CHILD [%d]: Error initializing alarm signal mask: %s\r\n", my_pid, strerror(errno));
         return -1;
     }
-    // Block SIGALRM itself during handler execution
     if (sigaddset(&sa_alarm.sa_mask, SIGALRM) == -1) {
-        perror("CHILD: Error adding SIGALRM to alarm signal mask");
+        // Use \r\n for stderr messages
+        fprintf(stderr, "CHILD [%d]: Error adding SIGALRM to alarm signal mask: %s\r\n", my_pid, strerror(errno));
         return -1;
     }
-    // CRITICAL: Do NOT use SA_RESTART for SIGALRM.
-    sa_alarm.sa_flags = 0;
+    sa_alarm.sa_flags = 0; // No SA_RESTART for SIGALRM
 
     if (sigaction(SIGALRM, &sa_alarm, NULL) == -1) {
-        perror("CHILD: Error setting SIGALRM handler");
+        // Use \r\n for stderr messages
+        fprintf(stderr, "CHILD [%d]: Error setting SIGALRM handler: %s\r\n", my_pid, strerror(errno));
         return -1;
     }
 
@@ -258,23 +267,25 @@ static int register_signal_handlers(void) {
     memset(&sa_usr, 0, sizeof(sa_usr));
     sa_usr.sa_handler = handle_usr_signals;
     if (sigemptyset(&sa_usr.sa_mask) == -1) {
-        perror("CHILD: Error initializing usr signal mask");
+        // Use \r\n for stderr messages
+        fprintf(stderr, "CHILD [%d]: Error initializing usr signal mask: %s\r\n", my_pid, strerror(errno));
         return -1;
     }
-    // Block SIGUSR1/SIGUSR2 during their handler execution (optional but good practice)
     if (sigaddset(&sa_usr.sa_mask, SIGUSR1) == -1 || sigaddset(&sa_usr.sa_mask, SIGUSR2) == -1) {
-        perror("CHILD: Error adding SIGUSR1/2 to usr signal mask");
+        // Use \r\n for stderr messages
+        fprintf(stderr, "CHILD [%d]: Error adding SIGUSR1/2 to usr signal mask: %s\r\n", my_pid, strerror(errno));
         return -1;
     }
-    // SA_RESTART is acceptable here as the handler is very simple.
-    sa_usr.sa_flags = SA_RESTART;
+    sa_usr.sa_flags = SA_RESTART; // SA_RESTART is okay here
 
     if (sigaction(SIGUSR1, &sa_usr, NULL) == -1) {
-        perror("CHILD: Error setting SIGUSR1 handler");
+        // Use \r\n for stderr messages
+        fprintf(stderr, "CHILD [%d]: Error setting SIGUSR1 handler: %s\r\n", my_pid, strerror(errno));
         return -1;
     }
     if (sigaction(SIGUSR2, &sa_usr, NULL) == -1) {
-        perror("CHILD: Error setting SIGUSR2 handler");
+        // Use \r\n for stderr messages
+        fprintf(stderr, "CHILD [%d]: Error setting SIGUSR2 handler: %s\r\n", my_pid, strerror(errno));
         return -1;
     }
 
@@ -284,7 +295,8 @@ static int register_signal_handlers(void) {
 /*
  * setup_timer
  *
- * Configures a one-shot timer using setitimer to send SIGALRM.
+ * Configures a one-shot timer using setitimer to send SIGALRM after
+ * ALARM_INTERVAL_US microseconds.
  *
  * Accepts: None
  * Returns:
@@ -292,13 +304,15 @@ static int register_signal_handlers(void) {
  */
 static int setup_timer(void) {
     struct itimerval timer;
+
     timer.it_value.tv_sec = 0;
     timer.it_value.tv_usec = ALARM_INTERVAL_US;
     timer.it_interval.tv_sec = 0;
     timer.it_interval.tv_usec = 0; // One-shot
 
     if (setitimer(ITIMER_REAL, &timer, NULL) == -1) {
-        perror("CHILD: Error setting timer with setitimer");
+        // Use \r\n for stderr messages
+        fprintf(stderr, "CHILD [%d]: Error setting timer with setitimer: %s\r\n", getpid(), strerror(errno));
         return -1;
     }
     return 0;

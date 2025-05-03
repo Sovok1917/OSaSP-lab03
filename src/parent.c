@@ -1,4 +1,3 @@
-/* /home/user/project/src/parent.c */
 /*
  * parent.c
  *
@@ -14,7 +13,7 @@
 #include <unistd.h>
 #include <signal.h>
 #include <termios.h> // For terminal raw mode
-#include <string.h>
+#include <string.h>  // For memset, strerror, memmove
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <errno.h> // For errno
@@ -43,8 +42,9 @@ static void cleanup_resources(void);
 static void handle_signal(int sig);
 static void register_signal_handlers(void);
 static int add_child_pid(pid_t pid);
+static void remove_child_pid_at_index(size_t index); // Added helper
 static void kill_all_children(const char *reason);
-static void signal_all_children(int sig); // New function
+static void signal_all_children(int sig);
 static void spawn_child(void);
 static void kill_last_child(void);
 static void list_children(void);
@@ -152,7 +152,7 @@ int main(int argc, char *argv[]) {
                 case 'k':
                     safe_write(STDOUT_FILENO, "\r\n", 2);
                     kill_all_children("Received 'k' command.");
-                    if (printf("PARENT [%d]: All children kill command processed.\r\n", getpid()) < 0) { /* Handle error? */ }
+                    // Message about completion now inside kill_all_children
                     break;
                 case '1': // Enable child output (SIGUSR1)
                     safe_write(STDOUT_FILENO, "\r\n", 2);
@@ -174,6 +174,9 @@ int main(int argc, char *argv[]) {
             }
             if (fflush(stdout) == EOF) {
                 fprintf(stderr, "Warning: fflush(stdout) failed in command loop.\n");
+            }
+            if (fflush(stderr) == EOF) {
+                fprintf(stderr, "Warning: fflush(stderr) failed in command loop.\n");
             }
         } else if (read_result == 0) {
             // EOF on stdin - treat as quit
@@ -359,6 +362,7 @@ static void cleanup_resources(void) {
  *
  * Signal handler for SIGINT, SIGTERM, SIGQUIT (sets termination flag)
  * and SIGCHLD (reaps zombies). Async-signal-safe.
+ * IMPORTANT: This handler only reaps zombies; it does NOT update g_child_pids.
  *
  * Accepts:
  *   sig - The signal number received.
@@ -372,10 +376,12 @@ static void handle_signal(int sig) {
         pid_t pid;
         // Reap all available zombies non-blockingly
         while ((pid = waitpid(-1, NULL, WNOHANG)) > 0) {
-            // Optionally log reaped child using safe_write
+            // Child reaped. We don't modify g_child_pids here for signal safety.
+            // The list will be cleaned up when kill/signal functions encounter ESRCH.
+            // Optionally log reaped child using safe_write for debugging:
             // char msg[64];
-            // int len = snprintf(msg, sizeof(msg),"PARENT: Reaped child %d\n", pid);
-            // if (len > 0) safe_write(STDERR_FILENO, msg, len);
+            // int len = snprintf(msg, sizeof(msg),"PARENT: Reaped child %d via SIGCHLD\n", pid);
+            // if (len > 0) safe_write(STDERR_FILENO, msg, (size_t)len);
         }
         // If waitpid returned -1 and errno is ECHILD, it means no children left (expected)
         // Otherwise, log unexpected errors if desired (using safe_write)
@@ -488,10 +494,54 @@ static int add_child_pid(pid_t pid) {
 }
 
 /*
+ * remove_child_pid_at_index
+ *
+ * Removes a child PID from the array at the specified index by shifting
+ * subsequent elements down. Assumes index is valid relative to current count.
+ *
+ * Accepts:
+ *   index - The index of the PID to remove.
+ *
+ * Returns: None
+ */
+static void remove_child_pid_at_index(size_t index) {
+    pid_t parent_pid = getpid(); // For potential error messages
+    if (index >= g_child_count) {
+        // Should not happen if called correctly, but add a safeguard
+        if (fprintf(stderr, "PARENT [%d]: Error: Invalid index %zu in remove_child_pid_at_index (count=%zu).\r\n",
+            parent_pid, index, g_child_count) < 0) { /* Handle error? */ }
+            return;
+    }
+
+    // Shift elements down using memmove (safer for overlapping regions, though not needed here)
+    size_t elements_to_move = g_child_count - index - 1;
+    if (elements_to_move > 0) {
+        memmove(&g_child_pids[index], &g_child_pids[index + 1], elements_to_move * sizeof(pid_t));
+    }
+
+    g_child_count--; // Decrement the count *after* shifting
+
+    // Optional: Consider shrinking the array with realloc if g_child_count becomes
+    // much smaller than g_child_capacity (e.g., less than half). Not implemented here.
+    // Example:
+    // if (g_child_capacity > INITIAL_CHILD_CAPACITY && g_child_count < g_child_capacity / 2) {
+    //     size_t new_capacity = g_child_capacity / 2;
+    //     if (new_capacity < INITIAL_CHILD_CAPACITY) new_capacity = INITIAL_CHILD_CAPACITY;
+    //     pid_t *new_pids = realloc(g_child_pids, new_capacity * sizeof(pid_t));
+    //     if (new_pids != NULL) { // Only update if realloc succeeds
+    //         g_child_pids = new_pids;
+    //         g_child_capacity = new_capacity;
+    //     } // Ignore realloc failure when shrinking
+    // }
+}
+
+
+/*
  * kill_all_children
  *
  * Sends SIGKILL to all currently tracked child processes.
- * Clears the internal list of children. Prints actions to stderr.
+ * Removes successfully killed or already exited (ESRCH) children from the list.
+ * Prints actions to stderr.
  *
  * Accepts:
  *   reason - A string indicating why children are being killed (for logging).
@@ -499,48 +549,66 @@ static int add_child_pid(pid_t pid) {
  * Returns: None
  */
 static void kill_all_children(const char *reason) {
+    pid_t parent_pid = getpid();
+
     if (g_child_count == 0) {
         // No message needed if called during cleanup with no children
-        // Only print if explicitly called via 'k' command etc.
+        // Only print if explicitly called via 'k' command etc. and not exiting
         if (strcmp(reason, "Parent exiting.") != 0) {
-            if (printf("PARENT [%d]: No children to kill.\r\n", getpid()) < 0) { /* Handle error? */ }
+            if (printf("PARENT [%d]: No children to kill.\r\n", parent_pid) < 0) { /* Handle error? */ }
         }
         return;
     }
 
     // Use stderr for the action message itself
-    pid_t parent_pid = getpid();
     if (fprintf(stderr, "PARENT [%d]: Killing all %zu children (%s).\r\n", parent_pid, g_child_count, reason) < 0) { /* Handle error? */ }
     if (fflush(stderr) == EOF) { /* Handle error? */ }
 
-    // Iterate backwards as removing elements conceptually
+    // Iterate backwards because we might remove elements
     for (size_t i = g_child_count; i > 0; --i) {
-        pid_t pid_to_kill = g_child_pids[i - 1];
+        size_t current_index = i - 1; // Index in the array
+        pid_t pid_to_kill = g_child_pids[current_index];
+
         // Use stderr for individual kill attempts/warnings
         if (fprintf(stderr, "PARENT [%d]: Sending SIGKILL to child PID %d...\r\n", parent_pid, pid_to_kill) < 0) { /* Handle error? */ }
         if (fflush(stderr) == EOF) { /* Handle error? */ }
 
-        if (kill(pid_to_kill, SIGKILL) == -1) {
+        int kill_result = kill(pid_to_kill, SIGKILL);
+
+        if (kill_result == -1) {
             if (errno == ESRCH) { // Process already dead
                 if (fprintf(stderr, "PARENT [%d]: Child PID %d already exited.\r\n", parent_pid, pid_to_kill) < 0) { /* Handle error? */ }
+                // Child is gone, remove it from the list
+                remove_child_pid_at_index(current_index);
             } else { // Other error (permissions?)
                 if (fprintf(stderr, "Warning: Failed to send SIGKILL to PID %d (errno %d: %s).\r\n",
                     pid_to_kill, errno, strerror(errno)) < 0) { /* Handle error? */ }
+                    // Don't remove on other errors, maybe log? Child might still be running.
             }
+        } else {
+            // Kill sent successfully. Remove from tracking list.
+            // SIGCHLD handler will do the reaping.
+            remove_child_pid_at_index(current_index);
         }
-        // SIGCHLD handler will eventually reap the process after SIGKILL
+        // NOTE: Because we remove the element at current_index, the loop
+        // condition (i > 0) and the next iteration's index calculation
+        // (i - 1) remain correct relative to the now-shorter list.
     }
 
-    // Clear the list after attempting to kill all
-    g_child_count = 0;
-    // Optional: Shrink the array back if memory is critical. Not implemented here.
+    // Report final status based on remaining count
+    if (g_child_count == 0) {
+        if (fprintf(stderr, "PARENT [%d]: All tracked children processed for killing.\r\n", parent_pid) < 0) { /* Handle error? */ }
+    } else {
+        if (fprintf(stderr, "PARENT [%d]: Processed children for killing. %zu children remain tracked due to kill errors.\r\n", parent_pid, g_child_count) < 0) { /* Handle error? */ }
+    }
+    if (fflush(stderr) == EOF) { /* Handle error? */ }
 }
 
 /*
  * signal_all_children
  *
  * Sends the specified signal (SIGUSR1 or SIGUSR2) to all tracked children.
- * Reports actions to stdout/stderr.
+ * Reports actions to stdout/stderr. Does NOT remove children on ESRCH here.
  *
  * Accepts:
  *   sig - The signal number to send (SIGUSR1 or SIGUSR2).
@@ -561,6 +629,7 @@ static void signal_all_children(int sig) {
     if (fflush(stderr) == EOF) { /* Handle error? */ }
 
     size_t signaled_count = 0;
+    size_t esrch_count = 0; // Count children already gone
     for (size_t i = 0; i < g_child_count; ++i) {
         pid_t child_pid = g_child_pids[i];
         if (kill(child_pid, sig) == 0) {
@@ -568,19 +637,20 @@ static void signal_all_children(int sig) {
         } else {
             // ESRCH means child likely exited between command and signal dispatch
             if (errno == ESRCH) {
-                // Optionally log that the child was already gone
+                esrch_count++;
+                // Optionally log that the child was already gone (can be noisy)
                 // fprintf(stderr, "PARENT [%d]: Child PID %d already exited before %s.\n", parent_pid, child_pid, sig_name);
             } else {
                 if (fprintf(stderr, "Warning: Failed to send %s to PID %d (errno %d: %s).\r\n",
                     sig_name, child_pid, errno, strerror(errno)) < 0) { /* Handle error? */ }
             }
-            // Consider removing dead PIDs from the list here if ESRCH occurs frequently,
-            // but the SIGCHLD handler should eventually clean them up.
+            // We do NOT remove the PID from the list here. Let kill_all/kill_last handle cleanup.
         }
     }
 
     // Report result to stdout
-    if (printf("PARENT [%d]: Sent %s to %zu children.\r\n", parent_pid, sig_name, signaled_count) < 0) { /* Handle error? */ }
+    if (printf("PARENT [%d]: Attempted to send %s to %zu children. Success: %zu, Already Exited: %zu.\r\n",
+        parent_pid, sig_name, g_child_count, signaled_count, esrch_count) < 0) { /* Handle error? */ }
 }
 
 
@@ -603,11 +673,15 @@ static void spawn_child(void) {
         return; // Continue parent operation
     } else if (pid == 0) {
         // --- Child Process ---
-        // Attempt to restore terminal settings for the child if it was inherited
-        if (isatty(STDIN_FILENO)) {
-            // Ignore error here, child might not need terminal control
-            tcsetattr(STDIN_FILENO, TCSAFLUSH, &g_orig_termios);
-        }
+
+        /* FIX: REMOVED this block to prevent child from resetting terminal mode */
+        /*
+         *       // Attempt to restore terminal settings for the child if it was inherited
+         *       if (isatty(STDIN_FILENO)) {
+         *           // Ignore error here, child might not need terminal control
+         *           tcsetattr(STDIN_FILENO, TCSAFLUSH, &g_orig_termios);
+    }
+    */
 
         // Reset signal handlers to defaults for the child
         struct sigaction sa;
@@ -649,40 +723,57 @@ static void spawn_child(void) {
  * kill_last_child
  *
  * Sends SIGKILL to the most recently spawned child process.
- * Removes the child from the list. Reports the action (stdout/stderr).
+ * Removes the child from the list if kill succeeds or fails with ESRCH.
+ * Reports the action (stdout/stderr).
  *
  * Accepts: None
  * Returns: None
  */
 static void kill_last_child(void) {
+    pid_t parent_pid = getpid();
+
     if (g_child_count == 0) {
-        if (printf("PARENT [%d]: No children to kill.\r\n", getpid()) < 0) { /* Handle error? */ }
+        if (printf("PARENT [%d]: No children to kill.\r\n", parent_pid) < 0) { /* Handle error? */ }
         return;
     }
 
     // Target the last child added
-    g_child_count--; // Decrement count first
-    pid_t pid_to_kill = g_child_pids[g_child_count]; // Get PID at new count index
+    size_t last_index = g_child_count - 1;
+    pid_t pid_to_kill = g_child_pids[last_index];
 
     // Use stderr for action message
-    pid_t parent_pid = getpid();
     if (fprintf(stderr, "PARENT [%d]: Sending SIGKILL to last child (PID %d).\r\n", parent_pid, pid_to_kill) < 0) { /* Handle error? */ }
     if (fflush(stderr) == EOF) { /* Handle error? */ }
 
-    if (kill(pid_to_kill, SIGKILL) == -1) {
+    int kill_result = kill(pid_to_kill, SIGKILL);
+    int removed = 0; // Flag to track if removed
+
+    if (kill_result == -1) {
         if (errno == ESRCH) { // Process already dead
             if (fprintf(stderr, "PARENT [%d]: Child PID %d already exited.\r\n", parent_pid, pid_to_kill) < 0) { /* Handle error? */ }
+            // Child is gone, remove it from the list
+            remove_child_pid_at_index(last_index);
+            removed = 1;
         } else { // Other error
             if (fprintf(stderr, "Warning: Failed to send SIGKILL to PID %d (errno %d: %s).\r\n",
                 pid_to_kill, errno, strerror(errno)) < 0) { /* Handle error? */ }
+                // Do not remove from list on other errors.
         }
-        // Proceed with removal from list even if kill failed (it might be dead or error)
+    } else {
+        // Kill sent successfully. Remove from tracking list.
+        // SIGCHLD handler will eventually reap the process.
+        remove_child_pid_at_index(last_index);
+        removed = 1;
     }
-    // SIGCHLD handler will eventually reap the process
 
     // Report result to stdout
-    if (printf("PARENT [%d]: Removed tracking for child %d. Remaining children: %zu\r\n",
-        parent_pid, pid_to_kill, g_child_count) < 0) { /* Handle error? */ }
+    if (removed) {
+        if (printf("PARENT [%d]: Removed tracking for child %d. Remaining children: %zu\r\n",
+            parent_pid, pid_to_kill, g_child_count) < 0) { /* Handle error? */ }
+    } else {
+        if (printf("PARENT [%d]: Did not remove tracking for child %d due to kill error. Remaining children: %zu\r\n",
+            parent_pid, pid_to_kill, g_child_count) < 0) { /* Handle error? */ }
+    }
 }
 
 /*
@@ -696,15 +787,45 @@ static void kill_last_child(void) {
  */
 static void list_children(void) {
     pid_t parent_pid = getpid();
-    if (printf("PARENT [%d]: Listing processes:\r\n", parent_pid) < 0) { return; }
-    if (printf("  Parent: %d\r\n", parent_pid) < 0) { return; }
+    // Use temporary buffer for potentially long output to minimize interleaved writes
+    char list_buf[4096]; // Adjust size if many children expected
+    int current_pos = 0;
+    int remaining_buf = sizeof(list_buf);
+    int ret;
+
+    ret = snprintf(list_buf + current_pos, remaining_buf, "PARENT [%d]: Listing processes:\r\n", parent_pid);
+    if (ret < 0 || ret >= remaining_buf) goto print_error;
+    current_pos += ret; remaining_buf -= ret;
+
+    ret = snprintf(list_buf + current_pos, remaining_buf, "  Parent: %d\r\n", parent_pid);
+    if (ret < 0 || ret >= remaining_buf) goto print_error;
+    current_pos += ret; remaining_buf -= ret;
+
     if (g_child_count == 0) {
-        if (printf("  No tracked children.\r\n") < 0) { return; }
+        ret = snprintf(list_buf + current_pos, remaining_buf, "  No tracked children.\r\n");
+        if (ret < 0 || ret >= remaining_buf) goto print_error;
+        current_pos += ret; remaining_buf -= ret;
     } else {
-        if (printf("  Tracked Children (%zu):\r\n", g_child_count) < 0) { return; }
+        ret = snprintf(list_buf + current_pos, remaining_buf, "  Tracked Children (%zu):\r\n", g_child_count);
+        if (ret < 0 || ret >= remaining_buf) goto print_error;
+        current_pos += ret; remaining_buf -= ret;
+
         for (size_t i = 0; i < g_child_count; ++i) {
-            // Indicate if child might still be running (no guarantee without checking kill(pid, 0))
-            if (printf("    - PID %d (status unknown)\r\n", g_child_pids[i]) < 0) { return; }
+            // Indicate status is based on tracking, not real-time check
+            ret = snprintf(list_buf + current_pos, remaining_buf, "    - PID %d (tracked)\r\n", g_child_pids[i]);
+            if (ret < 0 || ret >= remaining_buf) goto print_error;
+            current_pos += ret; remaining_buf -= ret;
         }
     }
+
+    // Write the whole buffer at once
+    if (safe_write(STDOUT_FILENO, list_buf, (size_t)current_pos) == -1) {
+        perror("PARENT: Error writing child list");
+    }
+    return;
+
+    print_error:
+    fprintf(stderr, "PARENT [%d]: Error: Buffer overflow while formatting child list.\r\n", parent_pid);
+    // Optionally print what was formatted so far
+    safe_write(STDOUT_FILENO, list_buf, (size_t)current_pos);
 }
