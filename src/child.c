@@ -74,7 +74,7 @@ int main(int argc, char *argv[]) {
 
 
     if (argc > 1) {
-
+        // Using \r\n for consistency, assuming terminal might be raw due to parent
         if (fprintf(stderr, "CHILD [%d]: Warning: Received unexpected arguments.\r\n", my_pid) < 0) { /* Handle error? */ }
     }
 
@@ -83,13 +83,12 @@ int main(int argc, char *argv[]) {
 
     pid_t parent_pid = getppid();
 
-
+    // Using \r\n for consistency
     if (fprintf(stderr, "CHILD [%d]: Started. PPID=%d. Output initially %s. Will run %d reps.\r\n",
         my_pid, parent_pid, g_output_enabled ? "ENABLED" : "DISABLED", NUM_REPETITIONS) < 0) { /* Handle error? */ }
         if (fflush(stderr) == EOF) {
-
+            // Using \r\n for consistency
             fprintf(stderr, "CHILD [%d]: Error flushing stderr on start: %s\r\n", my_pid, strerror(errno));
-
         }
 
         if (register_signal_handlers() != 0) {
@@ -123,7 +122,7 @@ int main(int argc, char *argv[]) {
 
             if (g_repetitions_done < NUM_REPETITIONS) {
                 if (setup_timer() != 0) {
-
+                    // Using \r\n for consistency
                     if (fprintf(stderr, "CHILD [%d]: Error re-arming timer. Exiting loop.\r\n", my_pid) < 0) { /* Handle error? */ }
                     break;
                 }
@@ -133,24 +132,24 @@ int main(int argc, char *argv[]) {
 
 
         if (g_output_enabled) {
-
-            if (printf("PPID=%d, PID=%d, STATS={00:%lld, 01:%lld, 10:%lld, 11:%lld}\n",
+            // MODIFIED: Changed \n to \r\n for the statistics line
+            if (printf("PPID=%d, PID=%d, STATS={00:%lld, 01:%lld, 10:%lld, 11:%lld}\r\n",
                 parent_pid, my_pid,
                 g_count00, g_count01, g_count10, g_count11) < 0) {
-
+                // Using \r\n for consistency
                 fprintf(stderr, "CHILD [%d]: Error writing final stats to stdout: %s\r\n", my_pid, strerror(errno));
                 }
                 if (fflush(stdout) == EOF) {
-
+                    // Using \r\n for consistency
                     fprintf(stderr, "CHILD [%d]: Error flushing stdout for stats: %s\r\n", my_pid, strerror(errno));
                 }
         } else {
-
+            // Using \r\n for consistency
             if (fprintf(stderr, "CHILD [%d]: Final statistics output suppressed by signal.\r\n", my_pid) < 0) { /* Handle error? */ }
             if (fflush(stderr) == EOF) { /* Handle error? */ }
         }
 
-
+        // Using \r\n for consistency
         if (fprintf(stderr, "CHILD [%d]: Exiting normally.\r\n", my_pid) < 0) { /* Handle error? */ }
         if (fflush(stderr) == EOF) { /* Handle error? */ }
 
@@ -246,19 +245,19 @@ static int register_signal_handlers(void) {
     memset(&sa_alarm, 0, sizeof(sa_alarm));
     sa_alarm.sa_handler = handle_alarm;
     if (sigemptyset(&sa_alarm.sa_mask) == -1) {
-
+        // Using \r\n for consistency
         fprintf(stderr, "CHILD [%d]: Error initializing alarm signal mask: %s\r\n", my_pid, strerror(errno));
         return -1;
     }
     if (sigaddset(&sa_alarm.sa_mask, SIGALRM) == -1) {
-
+        // Using \r\n for consistency
         fprintf(stderr, "CHILD [%d]: Error adding SIGALRM to alarm signal mask: %s\r\n", my_pid, strerror(errno));
         return -1;
     }
-    sa_alarm.sa_flags = 0;
+    sa_alarm.sa_flags = 0; // No SA_RESTART needed for SIGALRM here as we re-arm timer manually
 
     if (sigaction(SIGALRM, &sa_alarm, NULL) == -1) {
-
+        // Using \r\n for consistency
         fprintf(stderr, "CHILD [%d]: Error setting SIGALRM handler: %s\r\n", my_pid, strerror(errno));
         return -1;
     }
@@ -267,24 +266,24 @@ static int register_signal_handlers(void) {
     memset(&sa_usr, 0, sizeof(sa_usr));
     sa_usr.sa_handler = handle_usr_signals;
     if (sigemptyset(&sa_usr.sa_mask) == -1) {
-
+        // Using \r\n for consistency
         fprintf(stderr, "CHILD [%d]: Error initializing usr signal mask: %s\r\n", my_pid, strerror(errno));
         return -1;
     }
     if (sigaddset(&sa_usr.sa_mask, SIGUSR1) == -1 || sigaddset(&sa_usr.sa_mask, SIGUSR2) == -1) {
-
+        // Using \r\n for consistency
         fprintf(stderr, "CHILD [%d]: Error adding SIGUSR1/2 to usr signal mask: %s\r\n", my_pid, strerror(errno));
         return -1;
     }
-    sa_usr.sa_flags = SA_RESTART;
+    sa_usr.sa_flags = SA_RESTART; // Restart syscalls interrupted by these signals
 
     if (sigaction(SIGUSR1, &sa_usr, NULL) == -1) {
-
+        // Using \r\n for consistency
         fprintf(stderr, "CHILD [%d]: Error setting SIGUSR1 handler: %s\r\n", my_pid, strerror(errno));
         return -1;
     }
     if (sigaction(SIGUSR2, &sa_usr, NULL) == -1) {
-
+        // Using \r\n for consistency
         fprintf(stderr, "CHILD [%d]: Error setting SIGUSR2 handler: %s\r\n", my_pid, strerror(errno));
         return -1;
     }
@@ -307,11 +306,11 @@ static int setup_timer(void) {
 
     timer.it_value.tv_sec = 0;
     timer.it_value.tv_usec = ALARM_INTERVAL_US;
-    timer.it_interval.tv_sec = 0;
-    timer.it_interval.tv_usec = 0;
+    timer.it_interval.tv_sec = 0;  // One-shot timer
+    timer.it_interval.tv_usec = 0; // One-shot timer
 
     if (setitimer(ITIMER_REAL, &timer, NULL) == -1) {
-
+        // Using \r\n for consistency
         fprintf(stderr, "CHILD [%d]: Error setting timer with setitimer: %s\r\n", getpid(), strerror(errno));
         return -1;
     }
